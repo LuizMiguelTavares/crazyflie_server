@@ -1,0 +1,16 @@
+<launch>
+    <arg name="ids" default="" /> 
+    <arg name="use_z_velocity" default="" />
+    
+    <node pkg="crazyflie_server" type="crazyflie_server.py" name="crazyflie_server_node" output="screen">
+        <rosparam file="$(find crazyflie_server)/config/crazyflie_config.yaml" command="load" />
+        <param if="$(eval arg('ids') != '')" name="ids" value="$(arg ids)" />
+        <param if="$(eval arg('use_z_velocity') != '')" name="use_z_velocity" value="$(arg use_z_velocity)" />
+    </node>
+
+    <node pkg="crazyflie_server" type="crazyflie_copilot.py" name="crazyflie_copilot_node" output="screen">
+        <rosparam file="$(find crazyflie_server)/config/crazyflie_config.yaml" command="load" />
+        <param if="$(eval arg('ids') != '')" name="ids" value="$(arg ids)" />
+        <param if="$(eval arg('use_z_velocity') != '')" name="use_z_velocity" value="$(arg use_z_velocity)" />
+    </node>
+</launch>
