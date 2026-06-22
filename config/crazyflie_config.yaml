@@ -6,7 +6,7 @@ use_z_velocity: true # If true, cmd_vel angular x/y stay angle/rate and linear.z
 
 ids: [7] # Number of the Crazyflies to connect to (1-9)
 
-vel_LOG: false # Log velocity data
+vel_LOG: flase # Log velocity data
 ang_LOG: false # Log angle data
 thrust_LOG: false # Log thrust data
 acc_LOG: false # Log acceleration data

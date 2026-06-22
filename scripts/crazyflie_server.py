@@ -8,6 +8,7 @@ import math
 import rospy
 from geometry_msgs.msg import Twist, Vector3Stamped, PoseStamped
 from std_msgs.msg import Bool, Float32
+from std_srvs.srv import Trigger, TriggerResponse
 
 import cflib
 from cflib.crazyflie import Crazyflie
@@ -50,6 +51,7 @@ class CrazyflieServer:
         self.use_z_velocity         = rospy.get_param("~use_z_velocity", False)
         default_command_topic       = "_cmd_vel" if self.use_z_velocity else "cmd_vel"
         self.command_topic          = rospy.get_param("~command_topic", default_command_topic)
+        self.killed                 = False
                 
         # ---- Crazyflie link ----
         cflib.crtp.init_drivers(enable_debug_driver=False)
@@ -72,6 +74,8 @@ class CrazyflieServer:
 
         rospy.Subscriber(topic(self.command_topic), Twist, self._twist_cb)
         rospy.loginfo(f"[cf{self.cf_id}] listening for commands on {topic(self.command_topic)}")
+        self.kill_srv = rospy.Service(topic("kill"), Trigger, self._kill_srv)
+        self.reset_kill_srv = rospy.Service(topic("reset_kill"), Trigger, self._reset_kill_srv)
 
         if self.vel_LOG:             self.pub_vel          = rospy.Publisher(topic("crazyflieVel"),           Vector3Stamped, queue_size=10)
         if self.ang_LOG:             self.pub_ang          = rospy.Publisher(topic("crazyflieAng"),           Vector3Stamped, queue_size=10)
@@ -79,13 +83,14 @@ class CrazyflieServer:
         if self.acc_LOG:             self.pub_acc          = rospy.Publisher(topic("crazyflieAcc"),           Vector3Stamped, queue_size=10)
         if self.gyro_raw_LOG:        self.pub_gyro_raw     = rospy.Publisher(topic("crazyflieRawAngRate"),    Vector3Stamped, queue_size=10)
         if self.gyro_LOG:            self.pub_gyro         = rospy.Publisher(topic("crazyflieAngRate"),       Vector3Stamped, queue_size=10)
+        if self.pos_LOG:             self.pub_pos          = rospy.Publisher(topic("crazyfliePos"),           Vector3Stamped, queue_size=10)
 
         self.pub_is_flying       = rospy.Publisher(topic("crazyflieIsFlying"),       Bool,           queue_size=10)
         self.pub_can_fly         = rospy.Publisher(topic("crazyflieCanFly"),         Bool,           queue_size=10)
         self.pub_z_range         = rospy.Publisher(topic("crazyflieZRange"),         Vector3Stamped, queue_size=10)
         self.pub_battery_voltage = rospy.Publisher(topic("crazyflieBatteryVoltage"), Float32,        queue_size=10)
         self.pub_battery_level   = rospy.Publisher(topic("crazyflieBatteryLevel"),   Float32,        queue_size=10)
-        self.pub_pos             = rospy.Publisher(topic("crazyfliePos"),            Vector3Stamped, queue_size=10)
+        
 
         # flags to print “log started” once
         self._flags = {}
@@ -290,6 +295,11 @@ class CrazyflieServer:
 
     # ---- cmd_vel subscriber ----
     def _twist_cb(self, msg: Twist):
+        if self.killed:
+            rospy.logwarn_throttle(1.0, f"[cf{self.cf_id}] ignoring command: kill is active")
+            self._send_emergency_stop(repeats=1)
+            return
+
         if not math.isfinite(msg.linear.z):
             rospy.logwarn(f"[cf{self.cf_id}] received invalid thrust")
             self._cf.commander.send_setpoint(0, 0, 0, 0)
@@ -307,9 +317,46 @@ class CrazyflieServer:
             yawrate= -msg.angular.z * 57.2958
             self._cf.commander.send_setpoint(roll, pitch, yawrate, thrust)
 
+    # ---- emergency services ----
+    def _kill_srv(self, _):
+        self.kill("service")
+        return TriggerResponse(True, f"[cf{self.cf_id}] kill active")
+
+    def _reset_kill_srv(self, _):
+        self.killed = False
+        try:
+            self._cf.commander.send_setpoint(0, 0, 0, 0)
+            self._cf.platform.send_arming_request(True)
+        except Exception as e:
+            return TriggerResponse(False, f"[cf{self.cf_id}] reset_kill failed: {e}")
+        rospy.logwarn(f"[cf{self.cf_id}] kill reset; commands enabled")
+        return TriggerResponse(True, f"[cf{self.cf_id}] kill reset")
+
+    def kill(self, reason="kill"):
+        self.killed = True
+        rospy.logerr(f"[cf{self.cf_id}] KILL triggered by {reason}")
+        self._send_emergency_stop(repeats=5)
+
+    def _send_emergency_stop(self, repeats=3):
+        for _ in range(repeats):
+            try:
+                self._cf.commander.send_setpoint(0, 0, 0, 0)
+            except Exception:
+                pass
+            try:
+                self._cf.commander.send_stop_setpoint()
+            except Exception:
+                pass
+            try:
+                self._cf.platform.send_arming_request(False)
+            except Exception:
+                pass
+            time.sleep(0.02)
+
     # ---- cleanup ----
     def close(self):
         try:
+            self._send_emergency_stop(repeats=2)
             self._cf.close_link()
         except Exception:
             pass
@@ -328,6 +375,13 @@ def main():
         sys.exit(1)
 
     servers = [CrazyflieServer(cf_id=i) for i in ids]
+
+    def _kill_all_srv(_):
+        for s in servers:
+            s.kill("kill_all")
+        return TriggerResponse(True, "kill active for all Crazyflies")
+
+    kill_all_srv = rospy.Service("kill_all", Trigger, _kill_all_srv)
 
     # ---------- graceful shutdown ------------------------------------------
     def _close_everything():
