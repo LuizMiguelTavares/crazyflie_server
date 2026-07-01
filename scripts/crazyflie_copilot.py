@@ -22,6 +22,7 @@ class CopilotState:
         self.pitch = 0.0
         self.yaw = 0.0
         self.last_pos_time = None
+        self.last_mocap_rx_time = None
         self.has_pose = False
         self.has_velocity = False
         self.has_attitude = False
@@ -48,10 +49,14 @@ class CrazyflieCopilot:
         self.xy_hold_x = 0.0
         self.xy_hold_y = 0.0
         self.has_xy_hold = False
+        self.manual_control_enabled = False
 
         self.use_body_rate = rospy.get_param("~use_body_rate", True)
         self.control_rate = rospy.get_param("~copilot_control_rate", 50.0)
         self.cmd_timeout = rospy.get_param("~copilot_cmd_timeout", 0.3)
+        self.mocap_timeout = rospy.get_param("~mocap_timeout", 0.2)
+        self.mocap_kill_timeout = rospy.get_param("~mocap_kill_timeout", 0.75)
+        self.mocap_kill_triggered = False
         self.max_z_velocity_up = abs(rospy.get_param("~max_z_velocity_up", 0.5))
         self.max_z_velocity_down = abs(rospy.get_param("~max_z_velocity_down", 0.4))
 
@@ -87,6 +92,7 @@ class CrazyflieCopilot:
         )
 
         self.cmd_pub = rospy.Publisher(f"{self.ns}/_cmd_vel", Twist, queue_size=1)
+        self.kill_client = rospy.ServiceProxy(f"{self.ns}/kill", Trigger)
         rospy.Subscriber(f"{self.ns}/cmd_vel", Twist, self._cmd_cb, queue_size=1, tcp_nodelay=True)
         mocap_topic = self._resolve_mocap_pose_topic(cf_id)
         rospy.Subscriber(mocap_topic, PoseStamped, self._mocap_cb, queue_size=1, tcp_nodelay=True)
@@ -99,6 +105,13 @@ class CrazyflieCopilot:
         rospy.loginfo(f"[cf{self.cf_id}] z velocity mode enabled, mocap topic: {mocap_topic}")
 
     def _cmd_cb(self, msg):
+        if not self.manual_control_enabled:
+            rospy.logwarn_throttle(
+                1.0,
+                f"[cf{self.cf_id}] ignoring cmd_vel: takeoff has not completed",
+            )
+            return
+
         self.last_cmd = msg
         self.last_cmd_time = rospy.Time.now()
         if self.mode not in (self.MODE_TAKEOFF, self.MODE_LAND):
@@ -111,7 +124,9 @@ class CrazyflieCopilot:
         return topic.format(id=cf_id, cf_id=cf_id)
 
     def _mocap_cb(self, msg):
-        now = msg.header.stamp if msg.header.stamp != rospy.Time(0) else rospy.Time.now()
+        now = rospy.Time.now()
+        self.state.last_mocap_rx_time = now
+        self.mocap_kill_triggered = False
         p = msg.pose.position
         if self.state.last_pos_time is not None:
             dt = (now - self.state.last_pos_time).to_sec()
@@ -153,6 +168,7 @@ class CrazyflieCopilot:
         if not self.state.has_pose:
             return TriggerResponse(False, "copilot has no position estimate yet")
         self.mode = self.MODE_TAKEOFF
+        self.manual_control_enabled = False
         self.takeoff_start_time = rospy.Time.now()
         self.takeoff_start_z = self.state.z
         self.takeoff_settle_start_time = None
@@ -168,6 +184,7 @@ class CrazyflieCopilot:
 
     def _land_srv(self, _):
         self.mode = self.MODE_LAND
+        self.manual_control_enabled = False
         self.takeoff_start_time = None
         self.takeoff_settle_start_time = None
         self.xy_hold_x = self.state.x
@@ -184,6 +201,9 @@ class CrazyflieCopilot:
 
         if not self.state.has_pose:
             self._publish_stop()
+            return
+        if not self._mocap_is_fresh(now):
+            self._handle_mocap_timeout(now)
             return
 
         cmd_age = (now - self.last_cmd_time).to_sec()
@@ -209,6 +229,7 @@ class CrazyflieCopilot:
 
             if self._takeoff_is_settled(now, ramp_done):
                 self.mode = self.MODE_HOLD
+                self.manual_control_enabled = True
                 self.takeoff_start_time = None
                 self.takeoff_settle_start_time = None
                 vz_ref = 0.0
@@ -327,6 +348,44 @@ class CrazyflieCopilot:
 
     def _publish_stop(self):
         self.cmd_pub.publish(Twist())
+
+    def _mocap_is_fresh(self, now):
+        if self.mocap_timeout <= 0.0:
+            return True
+        if self.state.last_mocap_rx_time is None:
+            return False
+        return (now - self.state.last_mocap_rx_time).to_sec() <= self.mocap_timeout
+
+    def _mocap_age(self, now):
+        if self.state.last_mocap_rx_time is None:
+            return float("inf")
+        return (now - self.state.last_mocap_rx_time).to_sec()
+
+    def _handle_mocap_timeout(self, now):
+        rospy.logerr_throttle(
+            1.0,
+            f"[cf{self.cf_id}] mocap timeout; stopping copilot commands",
+        )
+        self.mode = self.MODE_IDLE
+        self.z_controller.reset()
+        self.level_rate_controller.reset()
+        self._publish_stop()
+
+        if self.mocap_kill_timeout <= 0.0 or self.mocap_kill_triggered:
+            return
+
+        age = self._mocap_age(now)
+        if age < self.mocap_kill_timeout:
+            return
+
+        self.mocap_kill_triggered = True
+        rospy.logerr(
+            f"[cf{self.cf_id}] mocap lost for {age:.2f}s; triggering server kill"
+        )
+        try:
+            self.kill_client()
+        except rospy.ServiceException as e:
+            rospy.logerr(f"[cf{self.cf_id}] failed to call kill service: {e}")
 
 
 def parse_ids(raw):

@@ -8,7 +8,7 @@ import math
 import rospy
 from geometry_msgs.msg import Twist, Vector3Stamped, PoseStamped
 from std_msgs.msg import Bool, Float32
-from std_srvs.srv import Trigger, TriggerResponse
+from std_srvs.srv import SetBool, SetBoolResponse, Trigger, TriggerResponse
 
 import cflib
 from cflib.crazyflie import Crazyflie
@@ -51,6 +51,8 @@ class CrazyflieServer:
         self.use_z_velocity         = rospy.get_param("~use_z_velocity", False)
         default_command_topic       = "_cmd_vel" if self.use_z_velocity else "cmd_vel"
         self.command_topic          = rospy.get_param("~command_topic", default_command_topic)
+        self.auto_arm               = rospy.get_param("~auto_arm", self.use_z_velocity)
+        self.armed                  = False
         self.killed                 = False
                 
         # ---- Crazyflie link ----
@@ -74,6 +76,7 @@ class CrazyflieServer:
 
         rospy.Subscriber(topic(self.command_topic), Twist, self._twist_cb)
         rospy.loginfo(f"[cf{self.cf_id}] listening for commands on {topic(self.command_topic)}")
+        self.arm_srv = rospy.Service(topic("arm"), SetBool, self._arm_srv)
         self.kill_srv = rospy.Service(topic("kill"), Trigger, self._kill_srv)
         self.reset_kill_srv = rospy.Service(topic("reset_kill"), Trigger, self._reset_kill_srv)
 
@@ -116,14 +119,10 @@ class CrazyflieServer:
         except Exception as e:
             rospy.logwarn(f"[cf{self.cf_id}] param set failed: {e}")
 
-        # IMPORTANTE para brushless / plataformas com arming manual
-        try:
-            time.sleep(0.2)
-            self._cf.platform.send_arming_request(True)
-            rospy.loginfo("Arming request sent")
-            time.sleep(0.5)
-        except Exception as e:
-            rospy.logerr(f"Error sending arming request: {e}")
+        if self.auto_arm:
+            self._set_armed(True, "startup")
+        else:
+            rospy.loginfo(f"[cf{self.cf_id}] waiting for {self.ns}/arm before accepting commands")
         
         # configure logs
         self._setup_logs()
@@ -299,6 +298,10 @@ class CrazyflieServer:
             rospy.logwarn_throttle(1.0, f"[cf{self.cf_id}] ignoring command: kill is active")
             self._send_emergency_stop(repeats=1)
             return
+        if not self.armed:
+            rospy.logwarn_throttle(1.0, f"[cf{self.cf_id}] ignoring command: not armed")
+            self._cf.commander.send_setpoint(0, 0, 0, 0)
+            return
 
         if not math.isfinite(msg.linear.z):
             rospy.logwarn(f"[cf{self.cf_id}] received invalid thrust")
@@ -317,6 +320,31 @@ class CrazyflieServer:
             yawrate= -msg.angular.z * 57.2958
             self._cf.commander.send_setpoint(roll, pitch, yawrate, thrust)
 
+    # ---- arm service ----
+    def _arm_srv(self, req):
+        ok, message = self._set_armed(req.data, "service")
+        return SetBoolResponse(ok, message)
+
+    def _set_armed(self, armed, reason):
+        if armed and self.killed:
+            return False, f"[cf{self.cf_id}] cannot arm while kill is active"
+
+        try:
+            if not armed:
+                self._cf.commander.send_setpoint(0, 0, 0, 0)
+                try:
+                    self._cf.commander.send_stop_setpoint()
+                except Exception:
+                    pass
+
+            self._cf.platform.send_arming_request(bool(armed))
+            self.armed = bool(armed)
+            state = "armed" if self.armed else "disarmed"
+            rospy.logwarn(f"[cf{self.cf_id}] {state} by {reason}")
+            return True, f"[cf{self.cf_id}] {state}"
+        except Exception as e:
+            return False, f"[cf{self.cf_id}] arm request failed: {e}"
+
     # ---- emergency services ----
     def _kill_srv(self, _):
         self.kill("service")
@@ -324,16 +352,17 @@ class CrazyflieServer:
 
     def _reset_kill_srv(self, _):
         self.killed = False
+        self.armed = False
         try:
             self._cf.commander.send_setpoint(0, 0, 0, 0)
-            self._cf.platform.send_arming_request(True)
         except Exception as e:
             return TriggerResponse(False, f"[cf{self.cf_id}] reset_kill failed: {e}")
-        rospy.logwarn(f"[cf{self.cf_id}] kill reset; commands enabled")
+        rospy.logwarn(f"[cf{self.cf_id}] kill reset; call /cf{self.cf_id}/arm before commands")
         return TriggerResponse(True, f"[cf{self.cf_id}] kill reset")
 
     def kill(self, reason="kill"):
         self.killed = True
+        self.armed = False
         rospy.logerr(f"[cf{self.cf_id}] KILL triggered by {reason}")
         self._send_emergency_stop(repeats=5)
 
@@ -351,6 +380,7 @@ class CrazyflieServer:
                 self._cf.platform.send_arming_request(False)
             except Exception:
                 pass
+            self.armed = False
             time.sleep(0.02)
 
     # ---- cleanup ----

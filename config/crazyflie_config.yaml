@@ -2,11 +2,11 @@ stabilizer_controller: 1 # 1 = PID, 2 = Mellinger, 3 = INDI, 4 = Brescianini
 stabilizer_estimator: 3  # 1 = Complementary filter, 2 = EKF, 3 = unscented Kalman filter
 
 use_body_rate: false # Send body rate reference instead of angle reference
-use_z_velocity: true # If true, cmd_vel angular x/y stay angle/rate and linear.z is z velocity
+use_z_velocity: true # If true, cmd_vel linear.z is z velocity
 
 ids: [7] # Number of the Crazyflies to connect to (1-9)
 
-vel_LOG: flase # Log velocity data
+vel_LOG: false # Log velocity data
 ang_LOG: false # Log angle data
 thrust_LOG: false # Log thrust data
 acc_LOG: false # Log acceleration data
@@ -16,11 +16,13 @@ gyro_LOG: false # Log gyro data
 # Copilot parameters used only when use_z_velocity is true
 copilot_control_rate: 50.0
 copilot_cmd_timeout: 0.3
+mocap_timeout: 0.2
+mocap_kill_timeout: 0.75
 max_z_velocity_up: 0.5
 max_z_velocity_down: 0.4
-mocap_pose_topic: "/vrpn_client_node/cf{id}/pose"
+# mocap_pose_topic: "/vrpn_client_node/cf{id}/pose"
 # For NatNet:
-# mocap_pose_topic: "/natnet_ros/cf{id}/pose"
+mocap_pose_topic: "/natnet_ros/cf{id}/pose"
 
 min_thrust: 10000
 max_thrust: 60000
@@ -36,10 +38,10 @@ z_vel_kp: 4.0
 # Used during takeoff/land when use_body_rate is true.
 # In angle mode the copilot simply sends roll = 0 and pitch = 0.
 level_rate_limit: 2.0 # rad/s
-level_roll_rate_kp: 2.0
-level_pitch_rate_kp: 2.0
+level_roll_rate_kp: 6.0
+level_pitch_rate_kp: 6.0
 
-takeoff_height: 0.5
+takeoff_height: 1
 takeoff_vz: 0.35
 takeoff_z_kp: 1.0
 takeoff_settle_error: 0.03
@@ -47,5 +49,5 @@ takeoff_settle_time: 1.0
 xy_hold_kp: 3.0
 xy_hold_kd: 1.0
 xy_hold_angle_limit: 0.25 # rad
-land_vz: -0.25
+land_vz: -0.4
 land_stop_height: 0.08
